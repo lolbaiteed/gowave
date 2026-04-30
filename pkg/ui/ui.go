@@ -1,3 +1,11 @@
+// Package ui provides the GoWave virtual DOM.
+//
+// ui.Node is a lightweight tree of elements that:
+//   - Renders to HTML strings on the server (SSR)
+//   - Compiles to WASM on the client and diffs against the live DOM
+//
+// All builder functions (Div, Span, Button, etc.) return a Node.
+// Modifiers (Class, Text, OnClick, etc.) are applied as NodeOptions.
 package ui
 
 import (
@@ -13,6 +21,7 @@ const (
 	ElementNode NodeType = iota
 	TextNode
 	FragmentNode
+	RawNode // raw unescaped content for inline <script>/<style>
 )
 
 // Node is a virtual DOM node. Zero value is a valid empty fragment.
@@ -246,6 +255,8 @@ func RenderHTML(n Node) string {
 
 func renderNode(sb *strings.Builder, n Node) {
 	switch n.Type {
+	case RawNode:
+		sb.WriteString(n.Text)
 	case TextNode:
 		sb.WriteString(html.EscapeString(n.Text))
 	case FragmentNode:
@@ -301,4 +312,13 @@ func el(tag string, opts []Option) Node {
 		}
 	}
 	return n
+}
+
+// ── Component interface ───────────────────────────────────────────────────────
+
+// Page is the interface every GoWave page component must satisfy.
+// Defined here so both the SSR renderer and the WASM runtime can use it
+// without importing each other.
+type Page interface {
+	Render() Node
 }

@@ -1,3 +1,4 @@
+// Package builder compiles a GoWave project to WASM + SSR bundle.
 package builder
 
 import (
@@ -6,19 +7,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/lolbaiteed/gowave/internal/parser"
 )
 
+// Config controls the build.
 type Config struct {
 	RootDir string
 	OutDir  string
-	Target  string
+	Target  string // "tinygo" | "go"
 	Minify  bool
 }
 
+// Run executes a full production build:
+//  1. Parse pages/ to discover routes
+//  2. Compile each route to WASM via TinyGo (or go tool compile)
+//  3. Run SSR pre-render and write HTML shells
+//  4. Copy public/ assets and emit gowave.js bridge
 func Run(cfg Config) error {
 	start := time.Now()
 
-	fmt.Printf("\n gowave build\n")
+	fmt.Printf("\n  gowave build\n")
 	fmt.Printf("  target: %s\n", cfg.Target)
 	fmt.Printf("  output: %s/\n\n", cfg.OutDir)
 
@@ -29,38 +38,41 @@ func Run(cfg Config) error {
 		{"discover routes", func() error { return discoverRoutes(cfg) }},
 		{"compile WASM", func() error { return compileWASM(cfg) }},
 		{"SSR pre-render", func() error { return preRender(cfg) }},
-		{"Copy assets", func() error { return copyAssets(cfg) }},
+		{"copy assets", func() error { return copyAssets(cfg) }},
 		{"emit bridge", func() error { return emitBridge(cfg) }},
 	}
 
 	for _, step := range steps {
 		fmt.Printf("  %-20s", step.name+"...")
 		if err := step.fn(); err != nil {
-			fmt.Printf("x\n")
+			fmt.Printf("✗\n")
 			return fmt.Errorf("step %q failed: %w", step.name, err)
 		}
 		fmt.Printf("✓\n")
 	}
 
-	fmt.Printf("\n built in %s -> %s/\n\n", time.Since(start).Round(time.Millisecond), cfg.OutDir)
+	fmt.Printf("\n  built in %s → %s/\n\n", time.Since(start).Round(time.Millisecond), cfg.OutDir)
 	return nil
 }
 
 func discoverRoutes(cfg Config) error {
-	pagesDir := filepath.Join(cfg.RootDir, "pages")
-	if _, err := os.Stat(pagesDir); os.IsNotExist(err) {
-		return fmt.Errorf("pages/ directory not found in %s", cfg.RootDir)
+	res, err := parser.ParsePages(cfg.RootDir)
+	if err != nil {
+		return err
 	}
-	return filepath.WalkDir(pagesDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && filepath.Ext(path) == ".go" {
-			rel, _ := filepath.Rel(cfg.RootDir, path)
-			fmt.Printf("  route: %s\n", rel)
-		}
-		return nil
-	})
+
+	m := &parser.Manifest{Routes: res.Routes, Warnings: res.Warnings}
+
+	// Print route table
+	m.Print()
+
+	// Write routes.json to cache dir for SSR renderer and dev server
+	cacheDir := filepath.Join(cfg.RootDir, cfg.OutDir)
+	if err := parser.WriteManifest(m, cacheDir); err != nil {
+		return fmt.Errorf("writing route manifest: %w", err)
+	}
+
+	return nil
 }
 
 func compileWASM(cfg Config) error {
@@ -79,14 +91,16 @@ func compileWASM(cfg Config) error {
 	}
 }
 
-func compileTinyGo(rootDir, outfile string) error {
+func compileTinyGo(rootDir, outFile string) error {
+	// Check TinyGo is available
 	if _, err := exec.LookPath("tinygo"); err != nil {
 		fmt.Printf("\n    ⚠ TinyGo not found — install from https://tinygo.org/getting-started/\n")
-		fmt.Printf("	  writing stub WASM for now\n	")
-		return os.WriteFile(outfile, []byte("(stub wasm - instll tinygo to compile)"), 0644)
+		fmt.Printf("    writing stub wasm for now\n    ")
+		// Write a stub so the rest of the pipeline can proceed
+		return os.WriteFile(outFile, []byte("(stub wasm — install tinygo to compile)"), 0644)
 	}
 	cmd := exec.Command("tinygo", "build",
-		"-o", outfile,
+		"-o", outFile,
 		"-target", "wasm",
 		"-no-debug",
 		".",
@@ -97,9 +111,9 @@ func compileTinyGo(rootDir, outfile string) error {
 	return cmd.Run()
 }
 
-func compileStdGo(rootDir, outfile string) error {
+func compileStdGo(rootDir, outFile string) error {
 	cmd := exec.Command("go", "build",
-		"-o", outfile,
+		"-o", outFile,
 		".",
 	)
 	cmd.Dir = rootDir
@@ -114,14 +128,15 @@ func preRender(cfg Config) error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
 	}
-	html := buildHTMLShell("", "")
+	// Write the index HTML shell that the WASM runtime hydrates into
+	html := buildHTMLShell("", "") // module path and app name resolved at runtime
 	return os.WriteFile(filepath.Join(outDir, "index.html"), []byte(html), 0644)
 }
 
 func copyAssets(cfg Config) error {
 	src := filepath.Join(cfg.RootDir, "public")
 	if _, err := os.Stat(src); os.IsNotExist(err) {
-		return nil
+		return nil // no public/ dir is fine
 	}
 	dst := filepath.Join(cfg.RootDir, cfg.OutDir)
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
@@ -142,9 +157,11 @@ func copyAssets(cfg Config) error {
 }
 
 func emitBridge(cfg Config) error {
+	// In a real build this would embed the production gowave.js
+	// For now, copy from public/ if it exists, or write the dev stub
 	dst := filepath.Join(cfg.RootDir, cfg.OutDir, "gowave.js")
 	src := filepath.Join(cfg.RootDir, "public", "gowave.js")
-	if data, err := os.ReadFile(src); err != nil {
+	if data, err := os.ReadFile(src); err == nil {
 		return os.WriteFile(dst, data, 0644)
 	}
 	return os.WriteFile(dst, []byte(productionBridgeStub), 0644)
@@ -167,6 +184,4 @@ func buildHTMLShell(modulePath, appName string) string {
 `
 }
 
-const productionBridgeStub = `/* gowave.js production bridge - emitted by 'gowave build' */`
-
-
+const productionBridgeStub = `/* gowave.js production bridge — emitted by 'gowave build' */`

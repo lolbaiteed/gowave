@@ -1,3 +1,11 @@
+// Package devserver runs the GoWave development server.
+//
+// It:
+//   - Builds the route manifest on startup via the parser
+//   - Serves SSR-rendered HTML via the ssr.Router for each route
+//   - Serves the compiled WASM bundle at /_wasm/main.wasm
+//   - Injects hot-reload SSE into every page
+//   - Watches .go files and rebuilds + broadcasts reload on change
 package devserver
 
 import (
@@ -6,12 +14,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/lolbaiteed/gowave/internal/builder"
+	"github.com/lolbaiteed/gowave/internal/parser"
+	"github.com/lolbaiteed/gowave/internal/ssr"
 	"github.com/lolbaiteed/gowave/internal/watcher"
+	"github.com/lolbaiteed/gowave/pkg/ui"
 )
 
 // Config controls the dev server.
@@ -33,121 +43,136 @@ type devServer struct {
 	cfg     Config
 	mu      sync.Mutex
 	clients map[chan string]struct{}
+
+	routerMu sync.RWMutex
+	router   *ssr.Router
 }
 
 func (s *devServer) start() error {
-	// Validate we're in a gowave project
 	if _, err := os.Stat(filepath.Join(s.cfg.RootDir, "gowave.toml")); os.IsNotExist(err) {
-		return fmt.Errorf("no gowave.toml found — are you in a GoWave project directory?")
+		return fmt.Errorf("no gowave.toml found — are you in a GoWave project?")
 	}
 
-	// Initial build
 	fmt.Printf("\n  gowave dev → http://localhost:%s\n\n", s.cfg.Port)
-	s.rebuild()
 
-	// Start file watcher
+	if err := s.rebuild(); err != nil {
+		fmt.Printf("  warn: initial build failed: %v\n", err)
+	}
+
 	w := watcher.New(s.cfg.RootDir, 400*time.Millisecond, func(ev watcher.Event) {
 		ext := filepath.Ext(ev.Path)
 		if ext == ".go" || ext == ".toml" {
 			rel, _ := filepath.Rel(s.cfg.RootDir, ev.Path)
 			fmt.Printf("  changed: %s — rebuilding...\n", rel)
-			s.rebuild()
-			s.broadcast("reload")
+			if err := s.rebuild(); err != nil {
+				fmt.Printf("  build error: %v\n", err)
+			} else {
+				s.broadcast("reload")
+			}
 		}
 	})
 	w.Start()
 	defer w.Stop()
 
 	mux := http.NewServeMux()
-
-	// SSE hot-reload endpoint
 	mux.HandleFunc("/_gowave/reload", s.handleSSE)
-
-	// WASM bundle
 	mux.HandleFunc("/_wasm/", s.handleWASM)
-
-	// TinyGo's wasm_exec.js (bundled with gowave)
 	mux.HandleFunc("/wasm_exec.js", s.handleWasmExec)
-
-	// Public assets
+	mux.HandleFunc("/gowave.js", s.handleGowaveJS)
 	mux.Handle("/public/", http.StripPrefix("/public/",
 		http.FileServer(http.Dir(filepath.Join(s.cfg.RootDir, "public"))),
 	))
-
-	// gowave.js bridge
-	mux.HandleFunc("/gowave.js", func(w http.ResponseWriter, r *http.Request) {
-		p := filepath.Join(s.cfg.RootDir, "public", "gowave.js")
-		if _, err := os.Stat(p); err == nil {
-			http.ServeFile(w, r, p)
-			return
-		}
-		w.Header().Set("Content-Type", "application/javascript")
-		fmt.Fprint(w, devBridgeScript)
-	})
-
-	// All other routes → SSR HTML shell with hot-reload injected
 	mux.HandleFunc("/", s.handlePage)
 
 	log.Printf("  watching for changes...\n\n")
 	return http.ListenAndServe(":"+s.cfg.Port, mux)
 }
 
-func (s *devServer) rebuild() {
-	cfg := builder.Config{
-		RootDir: s.cfg.RootDir,
-		OutDir:  ".gowave-cache",
-		Target:  "tinygo",
-	}
+func (s *devServer) rebuild() error {
 	start := time.Now()
-	if err := builder.Run(cfg); err != nil {
-		fmt.Printf("  build error: %v\n", err)
-		return
+
+	res, err := parser.ParsePages(s.cfg.RootDir)
+	if err != nil {
+		return fmt.Errorf("parse: %w", err)
 	}
-	fmt.Printf("  ready in %s\n", time.Since(start).Round(time.Millisecond))
+
+	m := &parser.Manifest{Routes: res.Routes, Warnings: res.Warnings}
+	cacheDir := filepath.Join(s.cfg.RootDir, ".gowave-cache")
+	if err := parser.WriteManifest(m, cacheDir); err != nil {
+		return fmt.Errorf("manifest: %w", err)
+	}
+
+	for _, w := range res.Warnings {
+		fmt.Printf("  warn: %s\n", w)
+	}
+
+	router := ssr.NewRouter(nil)
+	for _, route := range res.Routes {
+		router.Register(route.HTTPPath, makeDevPageFactory(route.HTTPPath, route.StructName))
+	}
+
+	s.routerMu.Lock()
+	s.router = router
+	s.routerMu.Unlock()
+
+	go func() {
+		bCfg := builder.Config{
+			RootDir: s.cfg.RootDir,
+			OutDir:  ".gowave-cache",
+			Target:  "tinygo",
+		}
+		_ = builder.Run(bCfg)
+	}()
+
+	fmt.Printf("  routes registered in %s\n", time.Since(start).Round(time.Millisecond))
+	m.Print()
+	fmt.Println()
+	return nil
+}
+
+func makeDevPageFactory(httpPath, structName string) func() ssr.Page {
+	return func() ssr.Page {
+		return &devPreviewPage{HTTPPath: httpPath, StructName: structName}
+	}
+}
+
+type devPreviewPage struct {
+	HTTPPath   string
+	StructName string
+}
+
+func (p *devPreviewPage) Render() ui.Node {
+	return ui.Div(ui.Class("container"),
+		ui.Child(rawBadge("gowave dev")),
+		ui.Child(ui.H1(ui.Text(p.StructName))),
+		ui.Child(ui.P(ui.Textf("Route: %s", p.HTTPPath))),
+		ui.Child(ui.P(ui.Text(
+			"This page is live. Add a Render() method to your page struct and it will appear here once GoWave supports live compilation.",
+		))),
+		ui.Child(ui.Pre(ui.Child(ui.Code(ui.Textf(
+			"// +gowave:page route=%q\ntype %s struct{}\n\nfunc (p *%s) Render() ui.Node {\n    return ui.Div(ui.Text(\"Hello!\"))\n}",
+			p.HTTPPath, p.StructName, p.StructName,
+		))))),
+	)
+}
+
+func rawBadge(text string) ui.Node {
+	return ui.Span(
+		ui.Attr2("style", "font-family:monospace;font-size:11px;background:#e1f5ee;color:#085041;padding:3px 8px;border-radius:4px;"),
+		ui.Text(text),
+	)
 }
 
 func (s *devServer) handlePage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, s.buildDevHTML(r.URL.Path))
-}
+	s.routerMu.RLock()
+	router := s.router
+	s.routerMu.RUnlock()
 
-func (s *devServer) buildDevHTML(route string) string {
-	title := "GoWave dev"
-	if route != "/" {
-		title = strings.Trim(route, "/") + " — GoWave"
+	if router == nil {
+		http.Error(w, "dev server starting — try again in a moment", http.StatusServiceUnavailable)
+		return
 	}
-	return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>` + title + `</title>
-  <script src="/wasm_exec.js"></script>
-</head>
-<body>
-  <div id="app-root">
-    <!-- SSR placeholder: in production this is pre-rendered Go HTML -->
-    <div style="font-family:monospace;padding:2rem;color:#888">
-      booting gowave runtime…
-    </div>
-  </div>
-  <script src="/gowave.js"></script>
-
-  <!-- Hot reload via SSE -->
-  <script>
-    (function() {
-      const es = new EventSource('/_gowave/reload');
-      es.addEventListener('reload', () => {
-        console.log('[gowave] reloading…');
-        location.reload();
-      });
-      es.addEventListener('error', () => {
-        console.log('[gowave] dev server disconnected');
-      });
-    })();
-  </script>
-</body>
-</html>`
+	router.ServeHTTP(w, r)
 }
 
 func (s *devServer) handleWASM(w http.ResponseWriter, r *http.Request) {
@@ -157,44 +182,57 @@ func (s *devServer) handleWASM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/wasm")
+	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, wasmPath)
 }
 
 func (s *devServer) handleWasmExec(w http.ResponseWriter, r *http.Request) {
-	// In production this would be the embedded TinyGo wasm_exec.js.
-	// For now, serve a stub that tells the user to install TinyGo.
+	for _, p := range []string{
+		"/usr/local/tinygo/targets/wasm_exec.js",
+		"/usr/lib/tinygo/targets/wasm_exec.js",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			http.ServeFile(w, r, p)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/javascript")
 	fmt.Fprint(w, wasmExecStub)
 }
 
-// handleSSE is the Server-Sent Events endpoint for hot reload.
+func (s *devServer) handleGowaveJS(w http.ResponseWriter, r *http.Request) {
+	p := filepath.Join(s.cfg.RootDir, "public", "gowave.js")
+	if _, err := os.Stat(p); err == nil {
+		http.ServeFile(w, r, p)
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript")
+	fmt.Fprint(w, devBridgeScript)
+}
+
 func (s *devServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "SSE not supported", http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	ch := make(chan string, 4)
-
 	s.mu.Lock()
 	s.clients[ch] = struct{}{}
 	s.mu.Unlock()
-
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, ch)
 		s.mu.Unlock()
 	}()
 
-	// Send initial ping to confirm connection
 	fmt.Fprintf(w, "event: ping\ndata: connected\n\n")
-	flusher.Flush()
+	flusher.(http.Flusher).Flush()
 
 	for {
 		select {
@@ -218,63 +256,48 @@ func (s *devServer) broadcast(event string) {
 	}
 }
 
-// devBridgeScript is the inline dev-mode WASM bridge.
-// It mirrors what public/gowave.js does when present.
 const devBridgeScript = `
 /* gowave.js — dev mode bridge */
 (async () => {
-  const go = new globalThis.Go?.() ?? null;
-  if (!go) {
-    console.warn('[gowave] wasm_exec.js not loaded — TinyGo runtime unavailable');
-    document.getElementById('app-root').innerHTML =
-      '<div style="font-family:monospace;padding:2rem">' +
-      '<b>GoWave dev server running.</b><br><br>' +
-      'Install <a href="https://tinygo.org/getting-started/">TinyGo</a> to compile your components to WASM.<br>' +
-      'Until then, SSR HTML is served directly.' +
-      '</div>';
+  if (typeof Go === 'undefined') {
+    console.warn('[gowave] wasm_exec.js not loaded. Install TinyGo to enable WASM interactivity.');
     return;
   }
+  const go = new Go();
   try {
-    const result = await WebAssembly.instantiateStreaming(
-      fetch('/_wasm/main.wasm'), go.importObject
-    );
+    const result = await WebAssembly.instantiateStreaming(fetch('/_wasm/main.wasm'), go.importObject);
     go.run(result.instance);
   } catch(e) {
-    console.error('[gowave] WASM load failed:', e);
+    console.warn('[gowave] WASM load skipped:', e.message);
   }
-
   globalThis.__gowave_patch = (patchJSON) => {
     const patches = JSON.parse(patchJSON);
     for (const op of patches) {
+      if (op.type === 'full_render') { document.getElementById('app-root').innerHTML = op.html; return; }
       const el = document.querySelector('[data-gw-id="' + op.id + '"]');
       if (!el) continue;
       if (op.type === 'set_text') el.textContent = op.value;
-      if (op.type === 'set_attr') el.setAttribute(op.key, op.value);
-      if (op.type === 'replace')  el.outerHTML = op.html;
+      if (op.type === 'set_attr')  el.setAttribute(op.key, op.value);
+      if (op.type === 'replace')   el.outerHTML = op.html;
     }
   };
-
   document.addEventListener('click', e => {
     const id = e.target.dataset?.gwClick;
-    if (id && globalThis.__gowave_dispatch) globalThis.__gowave_dispatch('click', id, '');
+    if (id && globalThis.__gowave_dispatch) { e.preventDefault(); globalThis.__gowave_dispatch('click', id, ''); }
   });
   document.addEventListener('input', e => {
     const id = e.target.dataset?.gwInput;
     if (id && globalThis.__gowave_dispatch) globalThis.__gowave_dispatch('input', id, e.target.value);
   });
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const id = e.target.dataset?.gwEnter;
+    if (id && globalThis.__gowave_dispatch) globalThis.__gowave_dispatch('enter', id, e.target.value);
+  });
 })();
 `
 
-// wasmExecStub — real wasm_exec.js is installed alongside TinyGo.
-// This stub avoids a 404 and shows a useful error.
 const wasmExecStub = `
-/* wasm_exec.js stub — real file ships with TinyGo */
-if (!globalThis.Go) {
-  globalThis.Go = class {
-    constructor() { this.importObject = { env: {}, wasi_snapshot_preview1: {} }; }
-    run() {}
-  };
-  console.warn('[gowave] TinyGo not installed — WASM compilation unavailable.');
-  console.warn('[gowave] Install TinyGo: https://tinygo.org/getting-started/');
-}
+/* wasm_exec.js stub — TinyGo not installed */
+console.warn('[gowave] TinyGo not installed. SSR is working; WASM interactivity requires TinyGo.');
 `
