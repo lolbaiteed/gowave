@@ -1,3 +1,4 @@
+// Package scaffold generates a new GoWave project from embedded templates.
 package scaffold
 
 import (
@@ -10,9 +11,10 @@ import (
 
 // Options controls what gowave new creates.
 type Options struct {
-	Name   string // project name, used in titles
-	Dir    string // output directory
-	Module string // Go module path
+	Name       string // project name, used in titles
+	Dir        string // output directory
+	Module     string // Go module path
+	GowavePath string // local path to the gowave framework source (for replace directive)
 }
 
 // Run scaffolds a full GoWave project into opts.Dir.
@@ -40,20 +42,20 @@ func Run(opts Options) error {
 
 func buildFileMap(opts Options) map[string]string {
 	return map[string]string{
-		"gowave.toml":        tmplGowaveToml,
-		"go.mod":             tmplGoMod,
-		"go.sum":             "",
-		"main.go":            tmplMainGo,
-		"layout.go":          tmplLayoutGo,
-		"pages/index.go":     tmplIndexPage,
-		"components/.keep":   "",
-		"store/.keep":        "",
-		"db/.keep":           "",
-		"middleware/.keep":   "",
-		"public/favicon.ico": "",
-		"public/gowave.js":   tmplGowaveJS,
-		".gitignore":         tmplGitignore,
-		"README.md":          tmplReadme,
+		"gowave.toml":               tmplGowaveToml,
+		"go.mod":                    tmplGoMod,
+		"go.sum":                    "",
+		"main.go":                   tmplMainGo,
+		"layout.go":                 tmplLayoutGo,
+		"pages/index.go":            tmplIndexPage,
+		"components/.keep":          "",
+		"store/.keep":               "",
+		"db/.keep":                  "",
+		"middleware/.keep":           "",
+		"public/favicon.ico":        "",
+		"public/gowave.js":          tmplGowaveJS,
+		".gitignore":                tmplGitignore,
+		"README.md":                 tmplReadme,
 	}
 }
 
@@ -102,77 +104,74 @@ const tmplGoMod = `module {{.Module}}
 go 1.22
 
 require (
-	github.com/lolbaiteed/gowave v0.1.0
+	github.com/gowave/gowave v0.1.0
 )
+{{- if .GowavePath}}
+
+replace github.com/gowave/gowave => {{.GowavePath}}
+{{- end}}
 `
 
 const tmplMainGo = `package main
 
 import (
-	"log"
-
-	"github.com/lolbaiteed/gowave/pkg/runtime"
+	"fmt"
+	"net/http"
+	"os"
 )
 
 func main() {
-	srv := runtime.NewServer(runtime.Config{
-		Port:    "3000",
-		RootDir: ".",
-	})
-
-	log.Printf("gowave dev → http://localhost:3000\n")
-
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+	port := "3000"
+	if p := os.Getenv("PORT"); p != "" {
+		port = p
+	}
+	fmt.Printf("gowave app → http://localhost:%s\n", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 `
 
 const tmplLayoutGo = `package main
 
-import "github.com/lolbaiteed/gowave/pkg/ui"
-
-// RootLayout wraps every page. The slot argument is the rendered page content.
+// RootLayout wraps every page. Implement Render(slot) once GoWave is published.
+// For now the dev server uses its own default shell.
+//
+// When gowave is available as a module:
+//
+//	import "github.com/gowave/gowave/pkg/ui"
+//
+//	func (l *RootLayout) Render(slot ui.Node) ui.Node {
+//	    return ui.Html(
+//	        ui.Head(ui.Child(ui.Title("{{.Name}}"))),
+//	        ui.Body(ui.Child(slot)),
+//	    )
+//	}
 type RootLayout struct{}
-
-func (l *RootLayout) Render(slot ui.Node) ui.Node {
-	return ui.Html(
-		ui.Head(
-			ui.Meta("charset", "utf-8"),
-			ui.Meta("viewport", "width=device-width, initial-scale=1"),
-			ui.Title("{{.Name}}"),
-			ui.Script("/gowave.js"),
-		),
-		ui.Body(
-			ui.Div(ui.Class("app"), slot),
-		),
-	)
-}
 `
 
 const tmplIndexPage = `package pages
 
-import "github.com/lolbaiteed/gowave/pkg/ui"
-
 // +gowave:page route="/"
+// IndexPage is the root page of your GoWave app.
+// Uncomment the Render method once github.com/gowave/gowave is available
+// (or set a replace directive in go.mod pointing to your local gowave source).
 type IndexPage struct {
 	Count int
 }
 
-func (p *IndexPage) Render() ui.Node {
-	return ui.Div(ui.Class("container"),
-		ui.H1(ui.Text("Hello from GoWave")),
-		ui.P(ui.Text("Go + WASM. No JavaScript written.")),
-		ui.Button(
-			ui.OnClick(p.Increment),
-			ui.Textf("clicked %d times", p.Count),
-		),
-	)
-}
-
-func (p *IndexPage) Increment() {
-	p.Count++
-}
+// func (p *IndexPage) Render() ui.Node {
+// 	return ui.Div(ui.Class("container"),
+// 		ui.H1(ui.Text("Hello from GoWave")),
+// 		ui.Button(
+// 			ui.OnClick(p.Increment),
+// 			ui.Textf("clicked %d times", p.Count),
+// 		),
+// 	)
+// }
+//
+// func (p *IndexPage) Increment() { p.Count++ }
 `
 
 const tmplGowaveJS = `/**
@@ -267,7 +266,7 @@ vendor/
 
 const tmplReadme = `# {{.Name}}
 
-Built with [GoWave](https://github.com/lolbaiteed/gowave) — Go + WebAssembly, no JS tax.
+Built with [GoWave](https://github.com/gowave/gowave) — Go + WebAssembly, no JS tax.
 
 ## Commands
 

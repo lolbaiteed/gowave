@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/lolbaiteed/gowave/internal/builder"
 	"github.com/lolbaiteed/gowave/internal/devserver"
@@ -55,9 +57,10 @@ func runNew(args []string) {
 	}
 	name := args[0]
 	opts := scaffold.Options{
-		Name:   name,
-		Dir:    name,
-		Module: "github.com/you/" + name,
+		Name:       name,
+		Dir:        name,
+		Module:     "github.com/you/" + name,
+		GowavePath: detectGowavePath(),
 	}
 	for i := 1; i < len(args)-1; i++ {
 		switch args[i] {
@@ -65,11 +68,38 @@ func runNew(args []string) {
 			opts.Module = args[i+1]
 		case "--dir":
 			opts.Dir = args[i+1]
+		case "--gowave":
+			opts.GowavePath = args[i+1]
 		}
 	}
 	if err := scaffold.Run(opts); err != nil {
 		fatalf("scaffold failed: %v\n", err)
 	}
+}
+
+// detectGowavePath returns the directory containing the gowave source,
+// inferred from the location of the running binary.
+func detectGowavePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	// Walk up from the binary looking for go.mod with module github.com/gowave/gowave
+	dir := filepath.Dir(exe)
+	for i := 0; i < 6; i++ {
+		mod := filepath.Join(dir, "go.mod")
+		if data, err := os.ReadFile(mod); err == nil {
+			if strings.Contains(string(data), "github.com/gowave/gowave") {
+				return dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
 }
 
 func runDev(args []string) {
@@ -133,6 +163,7 @@ Usage:
 Flags (new):
   --module <path>         Go module path  (default: github.com/you/<n>)
   --dir    <path>         Output directory (default: <n>)
+  --gowave <path>         Path to gowave source for replace directive
 
 Flags (dev):
   --port, -p <port>       Port to listen on (default: 3000)
