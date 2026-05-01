@@ -1,165 +1,149 @@
-//go:build js && wasm
-
-// Package main is the GoWave WASM client entry point.
-//
-// This file only compiles when targeting js/wasm (via TinyGo or go build
-// with GOOS=js GOARCH=wasm). It:
-//
-//  1. Exposes __gowave_dispatch to JavaScript so the bridge can route events
-//  2. Mounts the root component into #app-root
-//  3. Runs a render loop: on every state mutation, re-renders and patches the DOM
-//
-// The separation is clean: the Go component structs know nothing about WASM.
-// Only this file touches syscall/js.
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"syscall/js"
+	"os"
 
-	"github.com/lolbaiteed/gowave/pkg/ui"
+	"github.com/lolbaiteed/gowave/internal/builder"
+	"github.com/lolbaiteed/gowave/internal/devserver"
+	"github.com/lolbaiteed/gowave/internal/parser"
+	"github.com/lolbaiteed/gowave/internal/scaffold"
 )
 
-// Runtime is the WASM client runtime.
-// It owns the live component tree and the current rendered DOM state.
-type Runtime struct {
-	root     ui.Page         // the current mounted page component
-	prevHTML string          // last rendered HTML (for diffing)
-	appRoot  js.Value        // #app-root DOM element
-}
+const version = "0.1.0"
 
-var rt *Runtime
+const banner = `
+  __ _  _____      ____ ___   _____
+ / _` + "`" + `  |/ _ \ \ /\ / / _` + "`" + ` \ \ / / _ \
+| (_| | (_) \ V  V / (_| |\ V /  __/
+ \__, |\___/ \_/\_/ \__,_| \_/ \___|
+  __/ |
+ |___/   v` + version + `  — Go + WASM, no JS tax.
+`
 
 func main() {
-	rt = &Runtime{}
-
-	// Get the #app-root mount point
-	doc := js.Global().Get("document")
-	rt.appRoot = doc.Call("getElementById", "app-root")
-	if rt.appRoot.IsNull() || rt.appRoot.IsUndefined() {
-		fmt.Println("[gowave] #app-root not found — is the HTML shell loaded?")
-		// Block forever so the WASM binary stays alive
-		select {}
+	if len(os.Args) < 2 {
+		printHelp()
+		os.Exit(0)
 	}
 
-	// Expose __gowave_dispatch(event, handlerID, value) for the JS bridge
-	js.Global().Set("__gowave_dispatch", js.FuncOf(func(this js.Value, args []js.Value) any {
-		if len(args) < 3 {
-			return nil
+	cmd := os.Args[1]
+	args := os.Args[2:]
+
+	switch cmd {
+	case "new":
+		runNew(args)
+	case "dev":
+		runDev(args)
+	case "build":
+		runBuild(args)
+	case "routes":
+		runRoutes(args)
+	case "version", "--version", "-v":
+		fmt.Printf("gowave v%s\n", version)
+	case "help", "--help", "-h":
+		printHelp()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %q\n\nRun 'gowave help' for usage.\n", cmd)
+		os.Exit(1)
+	}
+}
+
+func runNew(args []string) {
+	if len(args) == 0 {
+		fatalf("usage: gowave new <project-name>\n")
+	}
+	name := args[0]
+	opts := scaffold.Options{
+		Name:   name,
+		Dir:    name,
+		Module: "github.com/you/" + name,
+	}
+	for i := 1; i < len(args)-1; i++ {
+		switch args[i] {
+		case "--module":
+			opts.Module = args[i+1]
+		case "--dir":
+			opts.Dir = args[i+1]
 		}
-		event := args[0].String()
-		id := args[1].String()
-		value := args[2].String()
+	}
+	if err := scaffold.Run(opts); err != nil {
+		fatalf("scaffold failed: %v\n", err)
+	}
+}
 
-		// Dispatch the event to the Go handler registry
-		ui.Dispatch(event, id, value)
-
-		// Re-render after any state mutation
-		if rt.root != nil {
-			rt.render()
+func runDev(args []string) {
+	port := "3000"
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--port" || args[i] == "-p" {
+			port = args[i+1]
 		}
-		return nil
-	}))
+	}
+	cfg := devserver.Config{
+		Port:    port,
+		RootDir: ".",
+	}
+	if err := devserver.Run(cfg); err != nil {
+		fatalf("dev server failed: %v\n", err)
+	}
+}
 
-	// Expose __gowave_mount(componentJSON) — called by the JS bridge
-	// once the WASM is ready, to hydrate the server-rendered HTML.
-	js.Global().Set("__gowave_mount", js.FuncOf(func(this js.Value, args []js.Value) any {
-		// Initial hydration: the SSR HTML is already in the DOM.
-		// We just need to register the current component so event
-		// dispatch knows what to re-render.
-		if rt.root != nil {
-			// Re-render to register all handlers for the current state.
-			ui.ClearHandlers()
-			_ = rt.root.Render()
+func runBuild(args []string) {
+	outDir := "dist"
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--out" || args[i] == "-o" {
+			outDir = args[i+1]
 		}
-		return nil
-	}))
-
-	fmt.Println("[gowave] WASM runtime ready")
-
-	// Block forever — Go callbacks keep the runtime alive.
-	select {}
-}
-
-// Mount sets the active page component and renders it.
-// Called by the generated page bootstrap code.
-func Mount(page ui.Page) {
-	if rt == nil {
-		fmt.Println("[gowave] Mount called before runtime init")
-		return
 	}
-	rt.root = page
-	rt.render()
-}
-
-// render re-renders the current component and patches the DOM.
-func (r *Runtime) render() {
-	if r.root == nil {
-		return
+	cfg := builder.Config{
+		RootDir: ".",
+		OutDir:  outDir,
+		Target:  "tinygo",
 	}
-
-	ui.ClearHandlers()
-	node := r.root.Render()
-	newHTML := ui.RenderHTML(node)
-
-	if newHTML == r.prevHTML {
-		return // nothing changed
-	}
-
-	patches := diff(r.prevHTML, newHTML)
-
-	if len(patches) == 0 || r.prevHTML == "" {
-		// First render or full replace — set innerHTML directly
-		r.appRoot.Set("innerHTML", newHTML)
-	} else {
-		// Apply patches via the JS bridge
-		r.applyPatches(patches)
-	}
-
-	r.prevHTML = newHTML
-}
-
-// ── Patch protocol ────────────────────────────────────────────────────────────
-
-// PatchOp is a single DOM mutation instruction.
-type PatchOp struct {
-	Type  string `json:"type"`
-	ID    string `json:"id,omitempty"`
-	Key   string `json:"key,omitempty"`
-	Value string `json:"value,omitempty"`
-	HTML  string `json:"html,omitempty"`
-}
-
-// diff computes the minimal set of patch ops between two HTML strings.
-// For the initial milestone this is a simple full-replace strategy.
-// A real differ (tree-level) is the next iteration.
-func diff(prev, next string) []PatchOp {
-	if prev == "" {
-		return nil // first render — handled by innerHTML assignment above
-	}
-	if prev == next {
-		return nil
-	}
-	// Full replace for now. The VDOM differ replaces this in the next milestone.
-	return []PatchOp{
-		{Type: "full_render", HTML: next},
+	if err := builder.Run(cfg); err != nil {
+		fatalf("build failed: %v\n", err)
 	}
 }
 
-// applyPatches sends patch ops to the JS bridge for DOM application.
-func (r *Runtime) applyPatches(patches []PatchOp) {
-	data, err := json.Marshal(patches)
+func runRoutes(args []string) {
+	dir := "."
+	if len(args) > 0 {
+		dir = args[0]
+	}
+	res, err := parser.ParsePages(dir)
 	if err != nil {
-		fmt.Printf("[gowave] patch marshal error: %v\n", err)
-		return
+		fatalf("parse failed: %v\n", err)
 	}
+	m := &parser.Manifest{Routes: res.Routes, Warnings: res.Warnings}
+	fmt.Printf("\n  routes in %s/pages/\n\n", dir)
+	m.Print()
+	fmt.Println()
+}
 
-	patchFn := js.Global().Get("__gowave_patch")
-	if patchFn.IsUndefined() || patchFn.IsNull() {
-		// Fallback: just set innerHTML
-		r.appRoot.Set("innerHTML", patches[len(patches)-1].HTML)
-		return
-	}
-	patchFn.Invoke(string(data))
+func printHelp() {
+	fmt.Print(banner)
+	fmt.Print(`
+Usage:
+  gowave new <n>          Scaffold a new project
+  gowave dev              Start dev server with hot reload
+  gowave build            Compile to WASM + SSR bundle
+  gowave routes [dir]     Print discovered routes (default: .)
+  gowave version          Show version
+
+Flags (new):
+  --module <path>         Go module path  (default: github.com/you/<n>)
+  --dir    <path>         Output directory (default: <n>)
+
+Flags (dev):
+  --port, -p <port>       Port to listen on (default: 3000)
+
+Flags (build):
+  --out, -o <dir>         Output directory (default: dist/)
+
+`)
+}
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "error: "+format, args...)
+	os.Exit(1)
 }
