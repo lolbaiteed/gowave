@@ -11,12 +11,12 @@ import (
 
 // Options controls what gowave new creates.
 type Options struct {
-	Name       string // project name, used in titles
-	Dir        string // output directory
-	Module     string // Go module path
-	GowavePath string // local path to the gowave framework source (for replace directive)
+    Name         string // project name, used in titles
+    Dir          string // output directory
+    Module       string // Go module path for the new project
+    GowavePath   string // local path to the gowave framework source
+    GowaveModule string // Go module name of the gowave framework
 }
-
 // Run scaffolds a full GoWave project into opts.Dir.
 func Run(opts Options) error {
 	if _, err := os.Stat(opts.Dir); err == nil {
