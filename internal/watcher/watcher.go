@@ -4,6 +4,7 @@ package watcher
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,9 +21,9 @@ type Watcher struct {
 	interval time.Duration
 	onChange func(Event)
 
-	mu       sync.Mutex
-	seen     map[string]time.Time
-	stopCh   chan struct{}
+	mu     sync.Mutex
+	seen   map[string]time.Time
+	stopCh chan struct{}
 }
 
 // New creates a Watcher rooted at dir, calling onChange on every detected change.
@@ -38,7 +39,6 @@ func New(dir string, interval time.Duration, onChange func(Event)) *Watcher {
 
 // Start begins polling in a background goroutine.
 func (w *Watcher) Start() {
-	// Snapshot the initial state
 	_, _ = w.snapshot()
 	go w.loop()
 }
@@ -70,7 +70,6 @@ func (w *Watcher) check() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Detect writes and creates
 	for path, modTime := range current {
 		prev, existed := w.seen[path]
 		if !existed {
@@ -80,7 +79,6 @@ func (w *Watcher) check() {
 		}
 	}
 
-	// Detect removals
 	for path := range w.seen {
 		if _, ok := current[path]; !ok {
 			w.onChange(Event{Path: path, Op: "remove"})
@@ -94,18 +92,29 @@ func (w *Watcher) snapshot() (map[string]time.Time, error) {
 	result := make(map[string]time.Time)
 	err := filepath.WalkDir(w.root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil // skip unreadable entries
+			return nil
 		}
-		// Skip hidden dirs, vendor, dist
+
 		base := d.Name()
-		if d.IsDir() && (base == ".git" || base == "vendor" || base == "dist" || base == "node_modules") {
-			return filepath.SkipDir
-		}
-		if !d.IsDir() {
-			info, err := d.Info()
-			if err == nil {
-				result[path] = info.ModTime()
+
+		// Skip directories that don't contain user-edited source
+		if d.IsDir() {
+			switch base {
+			case ".git", "vendor", "dist", "node_modules", ".gowave-cache":
+				return filepath.SkipDir
 			}
+			return nil
+		}
+
+		// Skip gowave-generated files — they are written and deleted on every
+		// build and would cause an infinite rebuild loop in the dev server.
+		if strings.HasPrefix(base, "_gowave_") {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err == nil {
+			result[path] = info.ModTime()
 		}
 		return nil
 	})

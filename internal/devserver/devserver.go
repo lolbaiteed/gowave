@@ -13,7 +13,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,7 +63,7 @@ func (s *devServer) start() error {
 
 	w := watcher.New(s.cfg.RootDir, 400*time.Millisecond, func(ev watcher.Event) {
 		ext := filepath.Ext(ev.Path)
-		if ext == ".go" || ext == ".toml" {
+		if (ext == ".go" || ext == ".toml") && !strings.HasPrefix(filepath.Base(ev.Path), "_gowave_") {
 			rel, _ := filepath.Rel(s.cfg.RootDir, ev.Path)
 			fmt.Printf("  changed: %s — rebuilding...\n", rel)
 			if err := s.rebuild(); err != nil {
@@ -187,17 +189,61 @@ func (s *devServer) handleWASM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *devServer) handleWasmExec(w http.ResponseWriter, r *http.Request) {
-	for _, p := range []string{
-		"/usr/local/tinygo/targets/wasm_exec.js",
-		"/usr/lib/tinygo/targets/wasm_exec.js",
-	} {
+	// Search common TinyGo installation locations, including:
+	//   - source builds (~/personal/tinygo, ~/tinygo, ~/go/tinygo)
+	//   - system installs (/usr/local/tinygo, /usr/lib/tinygo)
+	//   - TINYGOROOT env var (most reliable)
+	candidates := tinygoWasmExecPaths()
+	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {
+			w.Header().Set("Content-Type", "application/javascript")
 			http.ServeFile(w, r, p)
 			return
 		}
 	}
 	w.Header().Set("Content-Type", "application/javascript")
 	fmt.Fprint(w, wasmExecStub)
+}
+
+// tinygoWasmExecPaths returns candidate paths for TinyGo's wasm_exec.js,
+// checking TINYGOROOT first then common install/source locations.
+func tinygoWasmExecPaths() []string {
+	const rel = "targets/wasm_exec.js"
+	var paths []string
+
+	// 1. TINYGOROOT env var — set this to always win
+	if root := os.Getenv("TINYGOROOT"); root != "" {
+		paths = append(paths, filepath.Join(root, rel))
+	}
+
+	// 2. Common system and source locations
+	home, _ := os.UserHomeDir()
+	roots := []string{
+		"/usr/local/tinygo",
+		"/usr/lib/tinygo",
+		"/usr/share/tinygo",
+	}
+	if home != "" {
+		roots = append(roots,
+			filepath.Join(home, "tinygo"),
+			filepath.Join(home, "personal", "tinygo"),
+			filepath.Join(home, "go", "tinygo"),
+			filepath.Join(home, ".local", "tinygo"),
+		)
+	}
+	for _, r := range roots {
+		paths = append(paths, filepath.Join(r, rel))
+	}
+
+	// 3. Ask tinygo itself via `tinygo env TINYGOROOT`
+	if out, err := exec.Command("tinygo", "env", "TINYGOROOT").Output(); err == nil {
+		root := strings.TrimSpace(string(out))
+		if root != "" {
+			paths = append([]string{filepath.Join(root, rel)}, paths...)
+		}
+	}
+
+	return paths
 }
 
 func (s *devServer) handleGowaveJS(w http.ResponseWriter, r *http.Request) {
@@ -259,11 +305,15 @@ func (s *devServer) broadcast(event string) {
 const devBridgeScript = `
 /* gowave.js — dev mode bridge */
 (async () => {
-  if (typeof Go === 'undefined') {
-    console.warn('[gowave] wasm_exec.js not loaded. Install TinyGo to enable WASM interactivity.');
+  // Go constructor is defined by wasm_exec.js (TinyGo) on globalThis.
+  // If it is missing, wasm_exec.js failed to load or TinyGo is not installed.
+  const GoConstructor = globalThis.Go;
+  if (typeof GoConstructor !== 'function') {
+    console.warn('[gowave] wasm_exec.js did not define Go — TinyGo may not be installed or TINYGOROOT is not set.');
+    console.warn('[gowave] SSR is working. Set TINYGOROOT or install TinyGo for WASM interactivity.');
     return;
   }
-  const go = new Go();
+  const go = new GoConstructor();
   try {
     const result = await WebAssembly.instantiateStreaming(fetch('/_wasm/main.wasm'), go.importObject);
     go.run(result.instance);

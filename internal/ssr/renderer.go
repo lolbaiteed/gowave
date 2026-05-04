@@ -236,13 +236,15 @@ func defaultShell(content ui.Node) ui.Node {
 	)
 }
 
-// rawScript produces <script src="..."></script>
+// rawScript produces <script src="..." defer></script>
+// defer preserves execution order while not blocking HTML parsing.
 func rawScript(src string) ui.Node {
 	return ui.Node{
 		Type: ui.ElementNode,
 		Tag:  "script",
 		Attrs: []ui.Attr{
 			{Key: "src", Value: src},
+			{Key: "defer"},
 		},
 	}
 }

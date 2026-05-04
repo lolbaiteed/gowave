@@ -2,31 +2,23 @@
 
 // Package main is the GoWave WASM client entry point.
 //
-// This file only compiles when targeting js/wasm (via TinyGo or go build
-// with GOOS=js GOARCH=wasm). It:
-//
-//  1. Exposes __gowave_dispatch to JavaScript so the bridge can route events
-//  2. Mounts the root component into #app-root
-//  3. Runs a render loop: on every state mutation, re-renders and patches the DOM
-//
-// The separation is clean: the Go component structs know nothing about WASM.
-// Only this file touches syscall/js.
+// Intentionally imports only syscall/js and the ui package.
+// No encoding/json, no fmt, no net/http — TinyGo's stdlib shims
+// for those packages pull in net/http which is broken in TinyGo 0.42
+// for the js/wasm target.
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"syscall/js"
 
-	"github.com/gowave/gowave/pkg/ui"
+	"github.com/lolbaiteed/gowave/pkg/ui"
 )
 
-// Runtime is the WASM client runtime.
-// It owns the live component tree and the current rendered DOM state.
+// Runtime owns the live component tree and tracks the previous render.
 type Runtime struct {
-	root     ui.Page         // the current mounted page component
-	prevHTML string          // last rendered HTML (for diffing)
-	appRoot  js.Value        // #app-root DOM element
+	root     ui.Page
+	prevHTML string
+	appRoot  js.Value
 }
 
 var rt *Runtime
@@ -34,132 +26,121 @@ var rt *Runtime
 func main() {
 	rt = &Runtime{}
 
-	// Get the #app-root mount point
 	doc := js.Global().Get("document")
 	rt.appRoot = doc.Call("getElementById", "app-root")
 	if rt.appRoot.IsNull() || rt.appRoot.IsUndefined() {
-		fmt.Println("[gowave] #app-root not found — is the HTML shell loaded?")
-		// Block forever so the WASM binary stays alive
+		consoleWarn("[gowave] #app-root not found")
 		select {}
 	}
 
-	// Expose __gowave_dispatch(event, handlerID, value) for the JS bridge
-	js.Global().Set("__gowave_dispatch", js.FuncOf(func(this js.Value, args []js.Value) any {
+	// __gowave_dispatch(event, handlerID, value)
+	// Called by the JS bridge on every DOM event.
+	js.Global().Set("__gowave_dispatch", js.FuncOf(func(_ js.Value, args []js.Value) any {
 		if len(args) < 3 {
 			return nil
 		}
-		event := args[0].String()
-		id := args[1].String()
-		value := args[2].String()
-
-		// Dispatch the event to the Go handler registry
-		ui.Dispatch(event, id, value)
-
-		// Re-render after any state mutation
+		ui.Dispatch(args[0].String(), args[1].String(), args[2].String())
 		if rt.root != nil {
 			rt.render()
 		}
 		return nil
 	}))
 
-	// Expose __gowave_mount(componentJSON) — called by the JS bridge
-	// once the WASM is ready, to hydrate the server-rendered HTML.
-	js.Global().Set("__gowave_mount", js.FuncOf(func(this js.Value, args []js.Value) any {
-		// Initial hydration: the SSR HTML is already in the DOM.
-		// We just need to register the current component so event
-		// dispatch knows what to re-render.
+	// __gowave_mount()
+	// Called once by the JS bridge after WASM loads, to register handlers
+	// against the SSR HTML already in the DOM.
+	js.Global().Set("__gowave_mount", js.FuncOf(func(_ js.Value, _ []js.Value) any {
 		if rt.root != nil {
-			// Re-render to register all handlers for the current state.
 			ui.ClearHandlers()
 			_ = rt.root.Render()
 		}
 		return nil
 	}))
 
-	fmt.Println("[gowave] WASM runtime ready")
-
-	// Block forever — Go callbacks keep the runtime alive.
+	consoleLog("[gowave] WASM runtime ready")
 	select {}
 }
 
-// Mount sets the active page component and renders it.
-// Called by the generated page bootstrap code.
+// Mount sets the active page and triggers the first client render.
+// Called by generated page bootstrap code.
 func Mount(page ui.Page) {
 	if rt == nil {
-		fmt.Println("[gowave] Mount called before runtime init")
+		consoleWarn("[gowave] Mount called before runtime init")
 		return
 	}
 	rt.root = page
 	rt.render()
 }
 
-// render re-renders the current component and patches the DOM.
+// render re-renders the component tree and applies the result to the DOM.
 func (r *Runtime) render() {
 	if r.root == nil {
 		return
 	}
 
 	ui.ClearHandlers()
-	node := r.root.Render()
-	newHTML := ui.RenderHTML(node)
+	newHTML := ui.RenderHTML(r.root.Render())
 
 	if newHTML == r.prevHTML {
-		return // nothing changed
+		return
 	}
 
-	patches := diff(r.prevHTML, newHTML)
-
-	if len(patches) == 0 || r.prevHTML == "" {
-		// First render or full replace — set innerHTML directly
+	if r.prevHTML == "" {
+		// First client render — replace SSR placeholder directly.
 		r.appRoot.Set("innerHTML", newHTML)
 	} else {
-		// Apply patches via the JS bridge
-		r.applyPatches(patches)
+		// Subsequent renders — send a full-replace patch to the JS bridge.
+		// A tree-level differ will replace this in a future milestone.
+		r.patch(newHTML)
 	}
 
 	r.prevHTML = newHTML
 }
 
-// ── Patch protocol ────────────────────────────────────────────────────────────
-
-// PatchOp is a single DOM mutation instruction.
-type PatchOp struct {
-	Type  string `json:"type"`
-	ID    string `json:"id,omitempty"`
-	Key   string `json:"key,omitempty"`
-	Value string `json:"value,omitempty"`
-	HTML  string `json:"html,omitempty"`
-}
-
-// diff computes the minimal set of patch ops between two HTML strings.
-// For the initial milestone this is a simple full-replace strategy.
-// A real differ (tree-level) is the next iteration.
-func diff(prev, next string) []PatchOp {
-	if prev == "" {
-		return nil // first render — handled by innerHTML assignment above
-	}
-	if prev == next {
-		return nil
-	}
-	// Full replace for now. The VDOM differ replaces this in the next milestone.
-	return []PatchOp{
-		{Type: "full_render", HTML: next},
-	}
-}
-
-// applyPatches sends patch ops to the JS bridge for DOM application.
-func (r *Runtime) applyPatches(patches []PatchOp) {
-	data, err := json.Marshal(patches)
-	if err != nil {
-		fmt.Printf("[gowave] patch marshal error: %v\n", err)
-		return
-	}
-
+// patch sends a full-replace patch op to __gowave_patch in the JS bridge.
+// Hand-encoded JSON to avoid importing encoding/json.
+func (r *Runtime) patch(html string) {
 	patchFn := js.Global().Get("__gowave_patch")
 	if patchFn.IsUndefined() || patchFn.IsNull() {
-		// Fallback: just set innerHTML
-		r.appRoot.Set("innerHTML", patches[len(patches)-1].HTML)
+		r.appRoot.Set("innerHTML", html)
 		return
 	}
-	patchFn.Invoke(string(data))
+	patchFn.Invoke(`[{"type":"full_render","html":` + jsonString(html) + `}]`)
 }
+
+// ── Minimal helpers ───────────────────────────────────────────────────────────
+
+// jsonString encodes s as a JSON string literal without importing encoding/json.
+// Escapes \  "  \n  \r  \t  <  >  &  to keep the output safe inside HTML.
+func jsonString(s string) string {
+	out := make([]byte, 0, len(s)+2)
+	out = append(out, '"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			out = append(out, '\\', '"')
+		case '\\':
+			out = append(out, '\\', '\\')
+		case '\n':
+			out = append(out, '\\', 'n')
+		case '\r':
+			out = append(out, '\\', 'r')
+		case '\t':
+			out = append(out, '\\', 't')
+		case '<':
+			out = append(out, '\\', 'u', '0', '0', '3', 'c')
+		case '>':
+			out = append(out, '\\', 'u', '0', '0', '3', 'e')
+		case '&':
+			out = append(out, '\\', 'u', '0', '0', '2', '6')
+		default:
+			out = append(out, c)
+		}
+	}
+	out = append(out, '"')
+	return string(out)
+}
+
+func consoleLog(msg string)  { js.Global().Get("console").Call("log", msg) }
+func consoleWarn(msg string) { js.Global().Get("console").Call("warn", msg) }

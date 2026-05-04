@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/lolbaiteed/gowave/internal/parser"
@@ -31,24 +32,32 @@ func Run(cfg Config) error {
 	fmt.Printf("  target: %s\n", cfg.Target)
 	fmt.Printf("  output: %s/\n\n", cfg.OutDir)
 
-	steps := []struct {
-		name string
-		fn   func() error
-	}{
-		{"discover routes", func() error { return discoverRoutes(cfg) }},
-		{"compile WASM", func() error { return compileWASM(cfg) }},
-		{"SSR pre-render", func() error { return preRender(cfg) }},
-		{"copy assets", func() error { return copyAssets(cfg) }},
-		{"emit bridge", func() error { return emitBridge(cfg) }},
+	type step struct {
+		name     string
+		fn       func() error
+		softFail bool // if true, log warning but continue on error
 	}
 
-	for _, step := range steps {
-		fmt.Printf("  %-20s", step.name+"...")
-		if err := step.fn(); err != nil {
-			fmt.Printf("✗\n")
-			return fmt.Errorf("step %q failed: %w", step.name, err)
+	steps := []step{
+		{"discover routes", func() error { return discoverRoutes(cfg) }, false},
+		{"compile WASM", func() error { return compileWASM(cfg) }, true},
+		{"SSR pre-render", func() error { return preRender(cfg) }, false},
+		{"copy assets", func() error { return copyAssets(cfg) }, false},
+		{"emit bridge", func() error { return emitBridge(cfg) }, false},
+	}
+
+	for _, s := range steps {
+		fmt.Printf("  %-20s", s.name+"...")
+		if err := s.fn(); err != nil {
+			if s.softFail {
+				fmt.Printf("⚠ (skipped)\n")
+			} else {
+				fmt.Printf("✗\n")
+				return fmt.Errorf("step %q failed: %w", s.name, err)
+			}
+		} else {
+			fmt.Printf("✓\n")
 		}
-		fmt.Printf("✓\n")
 	}
 
 	fmt.Printf("\n  built in %s → %s/\n\n", time.Since(start).Round(time.Millisecond), cfg.OutDir)
@@ -80,25 +89,159 @@ func compileWASM(cfg Config) error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
 	}
-
 	outFile := filepath.Join(outDir, "main.wasm")
+
+	// Read the user project's module name from their go.mod
+	moduleName, err := readModuleName(cfg.RootDir)
+	if err != nil {
+		return fmt.Errorf("reading go.mod: %w", err)
+	}
+
+	// Generate a temporary WASM entry point in the user's project.
+	// This avoids hardcoding the gowave module path inside cmd/wasm.
+	entryFile := filepath.Join(cfg.RootDir, "_gowave_wasm_main.go")
+	if err := os.WriteFile(entryFile, []byte(wasmEntryTemplate(moduleName)), 0644); err != nil {
+		return fmt.Errorf("writing wasm entry: %w", err)
+	}
+	defer os.Remove(entryFile) // always clean up
 
 	switch cfg.Target {
 	case "tinygo":
 		return compileTinyGo(cfg.RootDir, outFile)
 	default:
-		return compileStdGo(cfg.RootDir, outFile)
+		return compileStdGoWASM(cfg.RootDir, outFile)
 	}
 }
 
-func compileTinyGo(rootDir, outFile string) error {
-	// Check TinyGo is available
-	if _, err := exec.LookPath("tinygo"); err != nil {
-		fmt.Printf("\n    ⚠ TinyGo not found — install from https://tinygo.org/getting-started/\n")
-		fmt.Printf("    writing stub wasm for now\n    ")
-		// Write a stub so the rest of the pipeline can proceed
-		return os.WriteFile(outFile, []byte("(stub wasm — install tinygo to compile)"), 0644)
+// readModuleName reads the module declaration from go.mod in dir.
+func readModuleName(dir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if err != nil {
+		return "", err
 	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "module ")), nil
+		}
+	}
+	return "", fmt.Errorf("module declaration not found in go.mod")
+}
+
+// wasmEntryTemplate returns a generated WASM entry point that imports
+// the user project's own module path for pkg/ui.
+// This file is written temporarily during build and deleted after.
+func wasmEntryTemplate(moduleName string) string {
+	return `//go:build js && wasm
+
+package main
+
+import (
+	"syscall/js"
+	"` + moduleName + `/pkg/ui"
+)
+
+type gwRuntime struct {
+	root     ui.Page
+	prevHTML string
+	appRoot  js.Value
+}
+
+var gwRT *gwRuntime
+
+func main() {
+	gwRT = &gwRuntime{}
+	doc := js.Global().Get("document")
+	gwRT.appRoot = doc.Call("getElementById", "app-root")
+	if gwRT.appRoot.IsNull() || gwRT.appRoot.IsUndefined() {
+		js.Global().Get("console").Call("warn", "[gowave] #app-root not found")
+		select {}
+	}
+	js.Global().Set("__gowave_dispatch", js.FuncOf(func(_ js.Value, args []js.Value) any {
+		if len(args) < 3 { return nil }
+		ui.Dispatch(args[0].String(), args[1].String(), args[2].String())
+		if gwRT.root != nil { gwRT.gwRender() }
+		return nil
+	}))
+	js.Global().Set("__gowave_mount", js.FuncOf(func(_ js.Value, _ []js.Value) any {
+		if gwRT.root != nil { ui.ClearHandlers(); _ = gwRT.root.Render() }
+		return nil
+	}))
+	js.Global().Get("console").Call("log", "[gowave] WASM runtime ready")
+	select {}
+}
+
+func (r *gwRuntime) gwRender() {
+	if r.root == nil { return }
+	ui.ClearHandlers()
+	newHTML := ui.RenderHTML(r.root.Render())
+	if newHTML == r.prevHTML { return }
+	if r.prevHTML == "" {
+		r.appRoot.Set("innerHTML", newHTML)
+	} else {
+		patchFn := js.Global().Get("__gowave_patch")
+		if patchFn.IsUndefined() || patchFn.IsNull() {
+			r.appRoot.Set("innerHTML", newHTML)
+		} else {
+			patchFn.Invoke(` + "`" + `[{"type":"full_render","html":` + "`" + ` + gwJSONString(newHTML) + ` + "`" + `}]` + "`" + `)
+		}
+	}
+	r.prevHTML = newHTML
+}
+
+func gwJSONString(s string) string {
+	out := make([]byte, 0, len(s)+2)
+	out = append(out, '"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':  out = append(out, '\', '"')
+		case '\': out = append(out, '\', '\')
+		case '
+': out = append(out, '\', 'n')
+		case '
+': out = append(out, '\', 'r')
+		case '	': out = append(out, '\', 't')
+		default:   out = append(out, c)
+		}
+	}
+	return string(append(out, '"'))
+}
+`
+}
+
+// WASMResult describes the outcome of a WASM compilation attempt.
+type WASMResult struct {
+	OK      bool
+	Skipped bool   // TinyGo not found
+	Err     error  // compilation failed but non-fatal
+	Hint    string // user-facing advice
+}
+
+func compileTinyGo(rootDir, outFile string) error {
+	res := tryCompileTinyGo(rootDir, outFile)
+	if res.Skipped {
+		fmt.Printf("\n    ⚠  TinyGo not installed — SSR works, WASM interactivity disabled")
+		fmt.Printf("\n       Install: https://tinygo.org/getting-started/\n    ")
+		return nil // soft-fail: SSR still works without WASM
+	}
+	if !res.OK {
+		fmt.Printf("\n    ⚠  TinyGo compile failed — SSR still works")
+		if res.Hint != "" {
+			fmt.Printf("\n       hint: %s", res.Hint)
+		}
+		fmt.Printf("\n       %v\n    ", res.Err)
+		return nil // soft-fail: don't break gowave dev over WASM
+	}
+	return nil
+}
+
+func tryCompileTinyGo(rootDir, outFile string) WASMResult {
+	if _, err := exec.LookPath("tinygo"); err != nil {
+		return WASMResult{Skipped: true}
+	}
+
+	var stderr strings.Builder
 	cmd := exec.Command("tinygo", "build",
 		"-o", outFile,
 		"-target", "wasm",
@@ -106,12 +249,60 @@ func compileTinyGo(rootDir, outFile string) error {
 		".",
 	)
 	cmd.Dir = rootDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		stderrStr := stderr.String()
+		hint := diagnoseWASMError(stderrStr)
+
+		// TinyGo 0.42 has a broken net/http shim for js/wasm.
+		// Fall back to standard Go WASM automatically.
+		if strings.Contains(stderrStr, "roundtrip_js.go") ||
+			strings.Contains(stderrStr, "roundTrip undefined") {
+			fmt.Printf("\n    TinyGo net/http bug detected — falling back to standard Go WASM\n    ")
+			return tryCompileStdGo(rootDir, outFile)
+		}
+
+		return WASMResult{Err: err, Hint: hint}
+	}
+	return WASMResult{OK: true}
 }
 
-func compileStdGo(rootDir, outFile string) error {
+func tryCompileStdGo(rootDir, outFile string) WASMResult {
+	var stderr strings.Builder
+	cmd := exec.Command("go", "build", "-o", outFile, "./cmd/wasm")
+	cmd.Dir = rootDir
+	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return WASMResult{Err: fmt.Errorf("std go wasm: %w", err), Hint: stderr.String()}
+	}
+	fmt.Printf("\n    note: using standard Go WASM (~2MB). TinyGo gives smaller bundles once fixed.\n    ")
+	return WASMResult{OK: true}
+}
+
+// diagnoseWASMError inspects TinyGo stderr and returns a human-friendly hint.
+func diagnoseWASMError(stderr string) string {
+	switch {
+	case strings.Contains(stderr, "no such file or directory") && strings.Contains(stderr, "compiler-rt"):
+		return "TinyGo can't find compiler-rt. On Fedora: sudo dnf install clang compiler-rt"
+	case strings.Contains(stderr, "clang") && strings.Contains(stderr, "not found"):
+		return "TinyGo needs clang. On Fedora: sudo dnf install clang"
+	case strings.Contains(stderr, "no such file or directory") && strings.Contains(stderr, "clang"):
+		return "clang version mismatch. Run: tinygo env CLANG and ensure that binary exists"
+	case strings.Contains(stderr, "syscall/js"):
+		return "add //go:build js && wasm build tag to WASM-only files"
+	case strings.Contains(stderr, "go.sum"):
+		return "run go mod tidy in your project first"
+	default:
+		if len(stderr) > 200 {
+			return stderr[:200] + "..."
+		}
+		return stderr
+	}
+}
+
+func compileStdGoWASM(rootDir, outFile string) error {
 	cmd := exec.Command("go", "build",
 		"-o", outFile,
 		".",

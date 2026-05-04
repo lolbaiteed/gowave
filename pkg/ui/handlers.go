@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -12,14 +11,31 @@ import (
 // looks up the handler here and calls it.
 
 var (
-	mu       sync.RWMutex
-	handlers = make(map[string]func())
+	mu            sync.RWMutex
+	handlers      = make(map[string]func())
 	inputHandlers = make(map[string]func(string))
-	seq      atomic.Uint64
+	seq           atomic.Uint64
 )
 
 func nextID() string {
-	return fmt.Sprintf("gw%d", seq.Add(1))
+	// Hand-rolled to avoid importing fmt, which TinyGo 0.42 transitively
+	// links against net/http via its js/wasm shims.
+	return "gw" + uitoa(seq.Add(1))
+}
+
+// uitoa converts a uint64 to its decimal string without importing fmt.
+func uitoa(n uint64) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for n > 0 {
+		pos--
+		buf[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[pos:])
 }
 
 // registerHandler stores a void handler and returns its ID.
