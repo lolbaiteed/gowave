@@ -16,26 +16,23 @@ import (
 type Config struct {
 	RootDir string
 	OutDir  string
-	Target  string // "tinygo" | "go"
-	Minify  bool
 }
 
 // Run executes a full production build:
 //  1. Parse pages/ to discover routes
-//  2. Compile each route to WASM via TinyGo (or go tool compile)
+//  2. Generate and compile WASM entry point (standard Go)
 //  3. Run SSR pre-render and write HTML shells
-//  4. Copy public/ assets and emit gowave.js bridge
+//  4. Copy public/ assets
 func Run(cfg Config) error {
 	start := time.Now()
 
 	fmt.Printf("\n  gowave build\n")
-	fmt.Printf("  target: %s\n", cfg.Target)
 	fmt.Printf("  output: %s/\n\n", cfg.OutDir)
 
 	type step struct {
 		name     string
 		fn       func() error
-		softFail bool // if true, log warning but continue on error
+		softFail bool
 	}
 
 	steps := []step{
@@ -43,14 +40,13 @@ func Run(cfg Config) error {
 		{"compile WASM", func() error { return compileWASM(cfg) }, true},
 		{"SSR pre-render", func() error { return preRender(cfg) }, false},
 		{"copy assets", func() error { return copyAssets(cfg) }, false},
-		{"emit bridge", func() error { return emitBridge(cfg) }, false},
 	}
 
 	for _, s := range steps {
 		fmt.Printf("  %-20s", s.name+"...")
 		if err := s.fn(); err != nil {
 			if s.softFail {
-				fmt.Printf("⚠ (skipped)\n")
+				fmt.Printf("⚠ (skipped: %v)\n", err)
 			} else {
 				fmt.Printf("✗\n")
 				return fmt.Errorf("step %q failed: %w", s.name, err)
@@ -69,21 +65,17 @@ func discoverRoutes(cfg Config) error {
 	if err != nil {
 		return err
 	}
-
 	m := &parser.Manifest{Routes: res.Routes, Warnings: res.Warnings}
-
-	// Print route table
 	m.Print()
-
-	// Write routes.json to cache dir for SSR renderer and dev server
-	cacheDir := filepath.Join(cfg.RootDir, cfg.OutDir)
-	if err := parser.WriteManifest(m, cacheDir); err != nil {
-		return fmt.Errorf("writing route manifest: %w", err)
-	}
-
-	return nil
+	return parser.WriteManifest(m, filepath.Join(cfg.RootDir, cfg.OutDir))
 }
 
+// compileWASM generates a self-contained temp build directory, compiles it
+// with standard Go (GOOS=js GOARCH=wasm), then removes the directory.
+//
+// The entry point imports pkg/ui from the gowave framework module.
+// We locate the framework by reading the replace directive in the
+// user project's go.mod.
 func compileWASM(cfg Config) error {
 	outDir := filepath.Join(cfg.RootDir, cfg.OutDir)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
@@ -91,26 +83,101 @@ func compileWASM(cfg Config) error {
 	}
 	outFile := filepath.Join(outDir, "main.wasm")
 
-	// Read the user project's module name from their go.mod
-	moduleName, err := readModuleName(cfg.RootDir)
+	// Find the gowave framework: module name + local path from replace directive.
+	gw, err := readGowaveModule(cfg.RootDir)
 	if err != nil {
-		return fmt.Errorf("reading go.mod: %w", err)
+		return fmt.Errorf("finding gowave module: %w", err)
 	}
 
-	// Generate a temporary WASM entry point in the user's project.
-	// This avoids hardcoding the gowave module path inside cmd/wasm.
-	entryFile := filepath.Join(cfg.RootDir, "_gowave_wasm_main.go")
-	if err := os.WriteFile(entryFile, []byte(wasmEntryTemplate(moduleName)), 0644); err != nil {
-		return fmt.Errorf("writing wasm entry: %w", err)
+	// Build in a temp subdirectory so it doesn't conflict with the
+	// project's own main.go (the HTTP server entry point).
+	wasmDir := filepath.Join(cfg.RootDir, ".gowave-wasm")
+	if err := os.MkdirAll(wasmDir, 0755); err != nil {
+		return err
 	}
-	defer os.Remove(entryFile) // always clean up
+	defer os.RemoveAll(wasmDir)
 
-	switch cfg.Target {
-	case "tinygo":
-		return compileTinyGo(cfg.RootDir, outFile)
-	default:
-		return compileStdGoWASM(cfg.RootDir, outFile)
+	// Standalone go.mod that replaces the gowave framework with local source.
+	gomod := "module gowave_wasm_build\n\ngo 1.22\n\nrequire " + gw.moduleName +
+		" v0.0.0-00010101000000-000000000000\n\nreplace " + gw.moduleName +
+		" => " + gw.localPath + "\n"
+
+	if err := os.WriteFile(filepath.Join(wasmDir, "go.mod"), []byte(gomod), 0644); err != nil {
+		return err
 	}
+	if err := os.WriteFile(filepath.Join(wasmDir, "go.sum"), nil, 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(wasmDir, "main.go"), []byte(wasmEntry(gw.moduleName)), 0644); err != nil {
+		return err
+	}
+
+	// Tidy the generated module before building.
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Dir = wasmDir
+	tidy.Env = os.Environ()
+	if out, err := tidy.CombinedOutput(); err != nil {
+		return fmt.Errorf("go mod tidy: %s", strings.TrimSpace(string(out)))
+	}
+
+	var stderr strings.Builder
+	cmd := exec.Command("go", "build", "-o", outFile, ".")
+	cmd.Dir = wasmDir
+	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// gowaveRef holds the resolved gowave framework module name and local path.
+type gowaveRef struct {
+	moduleName string // e.g. github.com/lolbaiteed/gowave
+	localPath  string // absolute path to the framework source
+}
+
+// readGowaveModule finds the gowave framework by reading the replace directive
+// from the user project's go.mod:
+//
+//	require github.com/lolbaiteed/gowave v0.0.0-...
+//	replace github.com/lolbaiteed/gowave => /home/misato/personal/gowave
+func readGowaveModule(projectDir string) (*gowaveRef, error) {
+	data, err := os.ReadFile(filepath.Join(projectDir, "go.mod"))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "replace ") {
+			continue
+		}
+		// "replace <module> => <path>"
+		parts := strings.Fields(line)
+		if len(parts) < 4 || parts[2] != "=>" {
+			continue
+		}
+		moduleName := parts[1]
+		localPath := parts[3]
+
+		if !filepath.IsAbs(localPath) {
+			localPath = filepath.Join(projectDir, localPath)
+		}
+
+		// Verify it looks like a gowave source tree (has pkg/ui).
+		if _, err := os.Stat(filepath.Join(localPath, "pkg", "ui")); err != nil {
+			continue
+		}
+
+		return &gowaveRef{moduleName: moduleName, localPath: localPath}, nil
+	}
+
+	return nil, fmt.Errorf(
+		"no replace directive pointing to gowave source found in go.mod\n" +
+			"add to your go.mod:\n" +
+			"  require github.com/yourname/gowave v0.0.0-00010101000000-000000000000\n" +
+			"  replace github.com/yourname/gowave => /path/to/gowave")
 }
 
 // readModuleName reads the module declaration from go.mod in dir.
@@ -128,17 +195,16 @@ func readModuleName(dir string) (string, error) {
 	return "", fmt.Errorf("module declaration not found in go.mod")
 }
 
-// wasmEntryTemplate returns a generated WASM entry point that imports
-// the user project's own module path for pkg/ui.
-// This file is written temporarily during build and deleted after.
-func wasmEntryTemplate(moduleName string) string {
+// wasmEntry returns the generated WASM entry point source.
+// It imports pkg/ui from the gowave framework module.
+func wasmEntry(gowaveModule string) string {
 	return `//go:build js && wasm
 
 package main
 
 import (
 	"syscall/js"
-	"` + moduleName + `/pkg/ui"
+	"` + gowaveModule + `/pkg/ui"
 )
 
 type gwRuntime struct {
@@ -147,35 +213,46 @@ type gwRuntime struct {
 	appRoot  js.Value
 }
 
-var gwRT *gwRuntime
+var rt *gwRuntime
 
 func main() {
-	gwRT = &gwRuntime{}
+	rt = &gwRuntime{}
 	doc := js.Global().Get("document")
-	gwRT.appRoot = doc.Call("getElementById", "app-root")
-	if gwRT.appRoot.IsNull() || gwRT.appRoot.IsUndefined() {
+	rt.appRoot = doc.Call("getElementById", "app-root")
+	if rt.appRoot.IsNull() || rt.appRoot.IsUndefined() {
 		js.Global().Get("console").Call("warn", "[gowave] #app-root not found")
 		select {}
 	}
 	js.Global().Set("__gowave_dispatch", js.FuncOf(func(_ js.Value, args []js.Value) any {
-		if len(args) < 3 { return nil }
+		if len(args) < 3 {
+			return nil
+		}
 		ui.Dispatch(args[0].String(), args[1].String(), args[2].String())
-		if gwRT.root != nil { gwRT.gwRender() }
+		if rt.root != nil {
+			rt.render()
+		}
 		return nil
 	}))
 	js.Global().Set("__gowave_mount", js.FuncOf(func(_ js.Value, _ []js.Value) any {
-		if gwRT.root != nil { ui.ClearHandlers(); _ = gwRT.root.Render() }
+		if rt.root != nil {
+			ui.ClearHandlers()
+			_ = rt.root.Render()
+		}
 		return nil
 	}))
 	js.Global().Get("console").Call("log", "[gowave] WASM runtime ready")
 	select {}
 }
 
-func (r *gwRuntime) gwRender() {
-	if r.root == nil { return }
+func (r *gwRuntime) render() {
+	if r.root == nil {
+		return
+	}
 	ui.ClearHandlers()
 	newHTML := ui.RenderHTML(r.root.Render())
-	if newHTML == r.prevHTML { return }
+	if newHTML == r.prevHTML {
+		return
+	}
 	if r.prevHTML == "" {
 		r.appRoot.Set("innerHTML", newHTML)
 	} else {
@@ -183,135 +260,34 @@ func (r *gwRuntime) gwRender() {
 		if patchFn.IsUndefined() || patchFn.IsNull() {
 			r.appRoot.Set("innerHTML", newHTML)
 		} else {
-			patchFn.Invoke(` + "`" + `[{"type":"full_render","html":` + "`" + ` + gwJSONString(newHTML) + ` + "`" + `}]` + "`" + `)
+			patchFn.Invoke("[{\"type\":\"full_render\",\"html\":" + gwJSON(newHTML) + "}]")
 		}
 	}
 	r.prevHTML = newHTML
 }
 
-func gwJSONString(s string) string {
-	out := make([]byte, 0, len(s)+2)
-	out = append(out, '"')
+func gwJSON(s string) string {
+	b := make([]byte, 0, len(s)+2)
+	b = append(b, '"')
 	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch c {
-		case '"':  out = append(out, '\', '"')
-		case '\': out = append(out, '\', '\')
-		case '
-': out = append(out, '\', 'n')
-		case '
-': out = append(out, '\', 'r')
-		case '	': out = append(out, '\', 't')
-		default:   out = append(out, c)
+		switch s[i] {
+		case '"':
+			b = append(b, '\\', '"')
+		case '\\':
+			b = append(b, '\\', '\\')
+		case '\n':
+			b = append(b, '\\', 'n')
+		case '\r':
+			b = append(b, '\\', 'r')
+		case '\t':
+			b = append(b, '\\', 't')
+		default:
+			b = append(b, s[i])
 		}
 	}
-	return string(append(out, '"'))
+	return string(append(b, '"'))
 }
 `
-}
-
-// WASMResult describes the outcome of a WASM compilation attempt.
-type WASMResult struct {
-	OK      bool
-	Skipped bool   // TinyGo not found
-	Err     error  // compilation failed but non-fatal
-	Hint    string // user-facing advice
-}
-
-func compileTinyGo(rootDir, outFile string) error {
-	res := tryCompileTinyGo(rootDir, outFile)
-	if res.Skipped {
-		fmt.Printf("\n    ⚠  TinyGo not installed — SSR works, WASM interactivity disabled")
-		fmt.Printf("\n       Install: https://tinygo.org/getting-started/\n    ")
-		return nil // soft-fail: SSR still works without WASM
-	}
-	if !res.OK {
-		fmt.Printf("\n    ⚠  TinyGo compile failed — SSR still works")
-		if res.Hint != "" {
-			fmt.Printf("\n       hint: %s", res.Hint)
-		}
-		fmt.Printf("\n       %v\n    ", res.Err)
-		return nil // soft-fail: don't break gowave dev over WASM
-	}
-	return nil
-}
-
-func tryCompileTinyGo(rootDir, outFile string) WASMResult {
-	if _, err := exec.LookPath("tinygo"); err != nil {
-		return WASMResult{Skipped: true}
-	}
-
-	var stderr strings.Builder
-	cmd := exec.Command("tinygo", "build",
-		"-o", outFile,
-		"-target", "wasm",
-		"-no-debug",
-		".",
-	)
-	cmd.Dir = rootDir
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		stderrStr := stderr.String()
-		hint := diagnoseWASMError(stderrStr)
-
-		// TinyGo 0.42 has a broken net/http shim for js/wasm.
-		// Fall back to standard Go WASM automatically.
-		if strings.Contains(stderrStr, "roundtrip_js.go") ||
-			strings.Contains(stderrStr, "roundTrip undefined") {
-			fmt.Printf("\n    TinyGo net/http bug detected — falling back to standard Go WASM\n    ")
-			return tryCompileStdGo(rootDir, outFile)
-		}
-
-		return WASMResult{Err: err, Hint: hint}
-	}
-	return WASMResult{OK: true}
-}
-
-func tryCompileStdGo(rootDir, outFile string) WASMResult {
-	var stderr strings.Builder
-	cmd := exec.Command("go", "build", "-o", outFile, "./cmd/wasm")
-	cmd.Dir = rootDir
-	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return WASMResult{Err: fmt.Errorf("std go wasm: %w", err), Hint: stderr.String()}
-	}
-	fmt.Printf("\n    note: using standard Go WASM (~2MB). TinyGo gives smaller bundles once fixed.\n    ")
-	return WASMResult{OK: true}
-}
-
-// diagnoseWASMError inspects TinyGo stderr and returns a human-friendly hint.
-func diagnoseWASMError(stderr string) string {
-	switch {
-	case strings.Contains(stderr, "no such file or directory") && strings.Contains(stderr, "compiler-rt"):
-		return "TinyGo can't find compiler-rt. On Fedora: sudo dnf install clang compiler-rt"
-	case strings.Contains(stderr, "clang") && strings.Contains(stderr, "not found"):
-		return "TinyGo needs clang. On Fedora: sudo dnf install clang"
-	case strings.Contains(stderr, "no such file or directory") && strings.Contains(stderr, "clang"):
-		return "clang version mismatch. Run: tinygo env CLANG and ensure that binary exists"
-	case strings.Contains(stderr, "syscall/js"):
-		return "add //go:build js && wasm build tag to WASM-only files"
-	case strings.Contains(stderr, "go.sum"):
-		return "run go mod tidy in your project first"
-	default:
-		if len(stderr) > 200 {
-			return stderr[:200] + "..."
-		}
-		return stderr
-	}
-}
-
-func compileStdGoWASM(rootDir, outFile string) error {
-	cmd := exec.Command("go", "build",
-		"-o", outFile,
-		".",
-	)
-	cmd.Dir = rootDir
-	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
 func preRender(cfg Config) error {
@@ -319,15 +295,22 @@ func preRender(cfg Config) error {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
 	}
-	// Write the index HTML shell that the WASM runtime hydrates into
-	html := buildHTMLShell("", "") // module path and app name resolved at runtime
+	const html = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n" +
+		"  <meta charset=\"utf-8\">\n" +
+		"  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" +
+		"  <title>GoWave App</title>\n" +
+		"  <script src=\"/wasm_exec.js\" defer></script>\n" +
+		"  <script src=\"/gowave.js\" defer></script>\n" +
+		"</head>\n<body>\n" +
+		"  <div id=\"app-root\"></div>\n" +
+		"</body>\n</html>\n"
 	return os.WriteFile(filepath.Join(outDir, "index.html"), []byte(html), 0644)
 }
 
 func copyAssets(cfg Config) error {
 	src := filepath.Join(cfg.RootDir, "public")
 	if _, err := os.Stat(src); os.IsNotExist(err) {
-		return nil // no public/ dir is fine
+		return nil
 	}
 	dst := filepath.Join(cfg.RootDir, cfg.OutDir)
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
@@ -346,33 +329,3 @@ func copyAssets(cfg Config) error {
 		return os.WriteFile(target, data, 0644)
 	})
 }
-
-func emitBridge(cfg Config) error {
-	// In a real build this would embed the production gowave.js
-	// For now, copy from public/ if it exists, or write the dev stub
-	dst := filepath.Join(cfg.RootDir, cfg.OutDir, "gowave.js")
-	src := filepath.Join(cfg.RootDir, "public", "gowave.js")
-	if data, err := os.ReadFile(src); err == nil {
-		return os.WriteFile(dst, data, 0644)
-	}
-	return os.WriteFile(dst, []byte(productionBridgeStub), 0644)
-}
-
-func buildHTMLShell(modulePath, appName string) string {
-	return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GoWave App</title>
-  <script src="/wasm_exec.js"></script>
-  <script src="/gowave.js"></script>
-</head>
-<body>
-  <div id="app-root"><!-- SSR content injected here --></div>
-</body>
-</html>
-`
-}
-
-const productionBridgeStub = `/* gowave.js production bridge — emitted by 'gowave build' */`

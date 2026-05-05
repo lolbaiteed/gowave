@@ -216,7 +216,6 @@ func runBuild(args []string) {
 	cfg := builder.Config{
 		RootDir: ".",
 		OutDir:  outDir,
-		Target:  "tinygo",
 	}
 	if err := builder.Run(cfg); err != nil {
 		fatalf("build failed: %v\n", err)

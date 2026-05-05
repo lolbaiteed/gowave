@@ -121,7 +121,6 @@ func (s *devServer) rebuild() error {
 		bCfg := builder.Config{
 			RootDir: s.cfg.RootDir,
 			OutDir:  ".gowave-cache",
-			Target:  "tinygo",
 		}
 		_ = builder.Run(bCfg)
 	}()
@@ -189,61 +188,29 @@ func (s *devServer) handleWASM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *devServer) handleWasmExec(w http.ResponseWriter, r *http.Request) {
-	// Search common TinyGo installation locations, including:
-	//   - source builds (~/personal/tinygo, ~/tinygo, ~/go/tinygo)
-	//   - system installs (/usr/local/tinygo, /usr/lib/tinygo)
-	//   - TINYGOROOT env var (most reliable)
-	candidates := tinygoWasmExecPaths()
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			w.Header().Set("Content-Type", "application/javascript")
-			http.ServeFile(w, r, p)
-			return
-		}
+	// Standard Go ships wasm_exec.js alongside the toolchain.
+	// Find it via GOROOT which is always set when Go is installed.
+	p := stdGoWasmExec()
+	if p != "" {
+		w.Header().Set("Content-Type", "application/javascript")
+		http.ServeFile(w, r, p)
+		return
 	}
 	w.Header().Set("Content-Type", "application/javascript")
 	fmt.Fprint(w, wasmExecStub)
 }
 
-// tinygoWasmExecPaths returns candidate paths for TinyGo's wasm_exec.js,
-// checking TINYGOROOT first then common install/source locations.
-func tinygoWasmExecPaths() []string {
-	const rel = "targets/wasm_exec.js"
-	var paths []string
-
-	// 1. TINYGOROOT env var — set this to always win
-	if root := os.Getenv("TINYGOROOT"); root != "" {
-		paths = append(paths, filepath.Join(root, rel))
-	}
-
-	// 2. Common system and source locations
-	home, _ := os.UserHomeDir()
-	roots := []string{
-		"/usr/local/tinygo",
-		"/usr/lib/tinygo",
-		"/usr/share/tinygo",
-	}
-	if home != "" {
-		roots = append(roots,
-			filepath.Join(home, "tinygo"),
-			filepath.Join(home, "personal", "tinygo"),
-			filepath.Join(home, "go", "tinygo"),
-			filepath.Join(home, ".local", "tinygo"),
-		)
-	}
-	for _, r := range roots {
-		paths = append(paths, filepath.Join(r, rel))
-	}
-
-	// 3. Ask tinygo itself via `tinygo env TINYGOROOT`
-	if out, err := exec.Command("tinygo", "env", "TINYGOROOT").Output(); err == nil {
-		root := strings.TrimSpace(string(out))
-		if root != "" {
-			paths = append([]string{filepath.Join(root, rel)}, paths...)
+// stdGoWasmExec returns the path to wasm_exec.js bundled with the Go toolchain.
+// It lives at $(go env GOROOT)/misc/wasm/wasm_exec.js.
+func stdGoWasmExec() string {
+	// Try go env GOROOT first — always correct regardless of install location.
+	if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
+		p := filepath.Join(strings.TrimSpace(string(out)), "misc", "wasm", "wasm_exec.js")
+		if _, err := os.Stat(p); err == nil {
+			return p
 		}
 	}
-
-	return paths
+	return ""
 }
 
 func (s *devServer) handleGowaveJS(w http.ResponseWriter, r *http.Request) {
@@ -304,13 +271,14 @@ func (s *devServer) broadcast(event string) {
 
 const devBridgeScript = `
 /* gowave.js — dev mode bridge */
-(async () => {
-  // Go constructor is defined by wasm_exec.js (TinyGo) on globalThis.
-  // If it is missing, wasm_exec.js failed to load or TinyGo is not installed.
+// Wrap in DOMContentLoaded so this runs after all defer'd scripts
+// (including wasm_exec.js) have executed, regardless of where in the
+// document these script tags appear.
+document.addEventListener('DOMContentLoaded', async () => {
   const GoConstructor = globalThis.Go;
   if (typeof GoConstructor !== 'function') {
-    console.warn('[gowave] wasm_exec.js did not define Go — TinyGo may not be installed or TINYGOROOT is not set.');
-    console.warn('[gowave] SSR is working. Set TINYGOROOT or install TinyGo for WASM interactivity.');
+    console.warn('[gowave] wasm_exec.js did not define globalThis.Go.');
+    console.warn('[gowave] SSR is working. WASM interactivity needs Go toolchain in PATH.');
     return;
   }
   const go = new GoConstructor();
@@ -344,10 +312,10 @@ const devBridgeScript = `
     const id = e.target.dataset?.gwEnter;
     if (id && globalThis.__gowave_dispatch) globalThis.__gowave_dispatch('enter', id, e.target.value);
   });
-})();
+}); // end DOMContentLoaded
 `
 
 const wasmExecStub = `
-/* wasm_exec.js stub — TinyGo not installed */
-console.warn('[gowave] TinyGo not installed. SSR is working; WASM interactivity requires TinyGo.');
+/* wasm_exec.js stub — Go toolchain not found */
+console.warn('[gowave] Could not find wasm_exec.js from Go toolchain. Ensure go is in PATH.');
 `
